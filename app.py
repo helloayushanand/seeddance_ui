@@ -86,12 +86,16 @@ def _poll():
     task = st.session_state.get("active_task")
     if not task or task["status"] in ("succeeded", "failed"):
         return
+    import datetime
+    print(f"[POLL] {datetime.datetime.now().strftime('%H:%M:%S')} checking task {task['id']} | current status: {task['status']}")
     try:
         client = api.get_client(API_KEY)
         result = api.get_task(client, task["id"])
         s = result.status
+        print(f"[POLL] API response status: {s} | raw result: {result}")
         if s == "succeeded":
             video_url = _extract_video_url(result)
+            print(f"[POLL] succeeded — video_url: {video_url}")
             tokens = getattr(getattr(result, "usage", None), "total_tokens", None) or 0
             cost = _calculate_cost(tokens, task.get("resolution", "720p"))
             st.session_state.active_task.update({"status": "succeeded", "video_url": video_url,
@@ -99,13 +103,17 @@ def _poll():
             history.update_task(task["id"], "succeeded", video_url, tokens=tokens, cost=cost)
             st.rerun()
         elif s == "failed":
+            print(f"[POLL] task failed | full result: {result}")
             st.session_state.active_task["status"] = "failed"
             history.update_task(task["id"], "failed")
             st.rerun()
         else:
+            print(f"[POLL] still in progress: {s}")
             st.session_state.active_task["status"] = s
-    except Exception:
-        pass
+    except Exception as e:
+        import traceback
+        print(f"[POLL] exception: {e}")
+        traceback.print_exc()
 
 _poll()
 
@@ -124,7 +132,7 @@ with st.sidebar:
     st.subheader("Tasks")
     active = st.session_state.active_task
     if active:
-        status_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄"}.get(active["status"], "⏳")
+        status_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄", "queued": "⏳"}.get(active["status"], "⏳")
         with st.container(border=True):
             st.caption(f"Latest · {active['id'][-8:]}")
             st.markdown(f"**{status_badge} {active['status'].capitalize()}**")
@@ -178,15 +186,17 @@ with st.sidebar:
                         changed = True
                     else:
                         history.update_task(t["id"], new_status)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import traceback
+                    print(f"[SIDEBAR_POLL] exception for task {t['id']}: {e}")
+                    traceback.print_exc()
             if changed:
                 st.rerun()
         else:
             st.caption("Recent")
 
         for t in tasks[:10]:
-            s_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄"}.get(t["status"], "❓")
+            s_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄", "queued": "⏳"}.get(t["status"], "❓")
             with st.expander(f"{s_badge} {t['id'][-12:]}"):
                 st.caption(t["created_at"][:16].replace("T", " "))
                 prompt_preview = t["prompt"][:60] + ("…" if len(t["prompt"]) > 60 else "")
