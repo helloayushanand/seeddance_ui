@@ -1,0 +1,19 @@
+# Secrets — never commit
+env.json
+.streamlit/secrets.toml
+
+# Local state
+history.json
+uploads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/

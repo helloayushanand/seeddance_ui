@@ -1,0 +1,17 @@
+streamlit>=1.35.0
+openai>=1.50.0
+byteplus-python-sdk-v2
+requests
+httpx
+httpcore
+pydantic
+anyio
+sniffio
+idna
+certifi
+Pillow
+
+# LangGraph + Gemini
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
