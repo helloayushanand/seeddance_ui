@@ -305,20 +305,26 @@ with layout_story:
     with st.container(border=True):
         st.subheader("Storyboard")
         st.caption(
-            "OpenAI **images.edit** (`gpt-image-2`) using the **storyboard source image** below "
-            "(separate from video reference images). Set `OPENAI_API_KEY` in `env.json`."
+            f"OpenAI **images.edit** (`gpt-image-2`) using up to **{storyboard.MAX_STORYBOARD_IMAGES}** "
+            "storyboard source images below (separate from video reference images). "
+            "Set `OPENAI_API_KEY` in `env.json`."
         )
         OPENAI_KEY = auth.get_openai_key()
-        sb_image = st.file_uploader(
-            "Storyboard source image",
+        sb_images = st.file_uploader(
+            f"Storyboard source images (up to {storyboard.MAX_STORYBOARD_IMAGES})",
             type=["jpg", "jpeg", "png", "webp"],
-            accept_multiple_files=False,
-            help="This image is sent to OpenAI for editing — not the same as Reference Images for video.",
+            accept_multiple_files=True,
+            help="These images are sent to OpenAI as references — not the same as Reference Images for video.",
             key="sb_source_image",
             label_visibility="visible",
         )
-        if sb_image:
-            st.image(sb_image, caption=sb_image.name, width="stretch")
+        if sb_images:
+            if len(sb_images) > storyboard.MAX_STORYBOARD_IMAGES:
+                st.warning(f"Only the first {storyboard.MAX_STORYBOARD_IMAGES} images will be used.")
+                sb_images = sb_images[: storyboard.MAX_STORYBOARD_IMAGES]
+            cols = st.columns(min(len(sb_images), 3))
+            for i, f in enumerate(sb_images):
+                cols[i % 3].image(f, width="stretch", caption=f.name)
         if "sb_prompt" not in st.session_state:
             st.session_state.sb_prompt = storyboard.DEFAULT_STORYBOARD_PROMPT
         sb_prompt = st.text_area("Storyboard prompt", height=160, key="sb_prompt")
@@ -332,17 +338,18 @@ with layout_story:
             elif not sb_prompt.strip():
                 st.error("Enter a storyboard prompt.")
             else:
-                loaded = storyboard.load_storyboard_upload(sb_image)
+                loaded = storyboard.load_storyboard_uploads(sb_images)
                 if not loaded:
-                    st.error("Upload a **Storyboard source image** (separate from video reference images).")
+                    st.error(
+                        f"Upload at least one **Storyboard source image** "
+                        f"(up to {storyboard.MAX_STORYBOARD_IMAGES}, separate from video reference images)."
+                    )
                 else:
-                    img_bytes, fname = loaded
                     with st.spinner("Creating storyboard image…"):
                         try:
                             out = storyboard.generate_storyboard_image(
                                 OPENAI_KEY,
-                                img_bytes,
-                                fname,
+                                loaded,
                                 sb_prompt,
                                 quality=sb_quality,
                                 size=sb_size,

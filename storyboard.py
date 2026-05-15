@@ -6,6 +6,8 @@ from io import BytesIO
 import requests
 from openai import OpenAI
 
+MAX_STORYBOARD_IMAGES = 5
+
 DEFAULT_STORYBOARD_PROMPT = """
 place exactly 4 ornaments onto a christmas tree. place into festive modern living room decorated for christmas. do not change appearance or finish of ornaments. use cheerful red and green theme. show full width of tree. Place evenly onto tree. ornaments should appear small scaled to fit on tree. Blend it properly into the scene. Blend the red color properly into the scene.
 """.strip()
@@ -18,40 +20,45 @@ def _file_like(image_bytes: bytes, filename: str) -> BytesIO:
     return buf
 
 
-def load_storyboard_upload(uploaded_file) -> tuple[bytes, str] | None:
-    """Read a Streamlit UploadedFile (or similar) for images.edit. Returns None if missing/empty."""
-    if uploaded_file is None:
+def load_storyboard_uploads(uploaded_files) -> list[tuple[bytes, str]] | None:
+    """Read Streamlit UploadedFiles for images.edit. Returns None if missing/empty."""
+    if not uploaded_files:
         return None
-    uploaded_file.seek(0)
-    data = uploaded_file.read()
-    if not data:
-        return None
-    name = getattr(uploaded_file, "name", None) or "storyboard.png"
-    return data, name
+    loaded: list[tuple[bytes, str]] = []
+    for uploaded_file in uploaded_files[:MAX_STORYBOARD_IMAGES]:
+        uploaded_file.seek(0)
+        data = uploaded_file.read()
+        if not data:
+            continue
+        name = getattr(uploaded_file, "name", None) or "storyboard.png"
+        loaded.append((data, name))
+    return loaded or None
 
 
 def generate_storyboard_image(
     api_key: str,
-    image_bytes: bytes,
-    filename: str,
+    images: list[tuple[bytes, str]],
     prompt: str,
     *,
     model: str = "gpt-image-2",
     quality: str = "medium",
     size: str = "1024x1024",
 ) -> bytes:
+    if not images:
+        raise ValueError("At least one source image is required")
     client = OpenAI(api_key=api_key)
-    img = _file_like(image_bytes, filename)
+    file_likes = [_file_like(image_bytes, filename) for image_bytes, filename in images]
     try:
         result = client.images.edit(
             model=model,
-            image=[img],
+            image=file_likes,
             prompt=prompt.strip(),
             quality=quality,
             size=size,
         )
     finally:
-        img.close()
+        for img in file_likes:
+            img.close()
 
     if not result.data:
         raise RuntimeError("OpenAI returned no image data")
