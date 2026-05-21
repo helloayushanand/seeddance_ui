@@ -54,7 +54,14 @@ def add_task(
     save(tasks)
 
 
-def update_task(task_id: str, status: str, video_url: str | None = None, tokens: int | None = None, cost: float | None = None) -> None:
+def update_task(
+    task_id: str,
+    status: str,
+    video_url: str | None = None,
+    tokens: int | None = None,
+    cost: float | None = None,
+    error_message: str | None = None,
+) -> None:
     tasks = load()
     for t in tasks:
         if t["id"] == task_id:
@@ -65,5 +72,7 @@ def update_task(task_id: str, status: str, video_url: str | None = None, tokens:
                 t["tokens"] = tokens
             if cost is not None:
                 t["cost"] = cost
+            if error_message is not None:
+                t["error_message"] = error_message
             break
     save(tasks)

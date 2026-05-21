@@ -37,6 +37,13 @@ def _calculate_cost(tokens: int, resolution: str) -> float:
     return (tokens / 1_000_000) * rate
 
 
+def _show_task_error(label: str, error_message: str | None) -> None:
+    """Show Seedance API failure details in the UI."""
+    st.error(label)
+    if error_message:
+        st.code(error_message, language=None)
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Seedance 2.0 Demo", page_icon="🎬", layout="wide")
 
@@ -103,9 +110,10 @@ def _poll():
             history.update_task(task["id"], "succeeded", video_url, tokens=tokens, cost=cost)
             st.rerun()
         elif s == "failed":
-            print(f"[POLL] task failed | full result: {result}")
-            st.session_state.active_task["status"] = "failed"
-            history.update_task(task["id"], "failed")
+            err_msg = api.extract_task_error(result)
+            print(f"[POLL] task failed | error: {err_msg} | full result: {result}")
+            st.session_state.active_task.update({"status": "failed", "error_message": err_msg})
+            history.update_task(task["id"], "failed", error_message=err_msg)
             st.rerun()
         else:
             print(f"[POLL] still in progress: {s}")
@@ -147,7 +155,7 @@ with st.sidebar:
                 if active.get("cost") is not None:
                     st.caption(f"Cost: ${active['cost']:.4f} · {active.get('tokens', 0):,} tokens")
             elif active["status"] == "failed":
-                st.error("Generation failed")
+                _show_task_error("Generation failed", active.get("error_message"))
             else:
                 st.caption("Polling every 30s…")
 
@@ -182,7 +190,9 @@ with st.sidebar:
                         t["cost"] = cost
                         changed = True
                     elif new_status == "failed":
-                        history.update_task(t["id"], new_status)
+                        err_msg = api.extract_task_error(result)
+                        history.update_task(t["id"], new_status, error_message=err_msg)
+                        t["error_message"] = err_msg
                         changed = True
                     else:
                         history.update_task(t["id"], new_status)
@@ -245,6 +255,9 @@ with st.sidebar:
                     elif t.get("tokens"):
                         cost = _calculate_cost(t["tokens"], t.get("settings", {}).get("resolution", "720p"))
                         st.caption(f"Cost: ${cost:.4f} · {t['tokens']:,} tokens")
+
+                if t["status"] == "failed":
+                    _show_task_error("Generation failed", t.get("error_message"))
 
                 if t["status"] not in ("succeeded", "failed"):
                     st.caption(f"Status: **{t['status']}** · next check in ~30s")
@@ -644,5 +657,7 @@ with layout_main:
                 st.session_state.show_game = True
                 st.rerun()
             except Exception as e:
-                st.error(f"Failed to create task: {e}")
+                err_detail = api.format_api_exception(e)
+                print(f"[APP] create_task failed: {err_detail}")
+                _show_task_error("Failed to create task", err_detail)
 
