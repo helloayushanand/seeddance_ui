@@ -12,7 +12,7 @@ Steps:
   5. Submit Seedance with final_prompt and poll until done
 
 Run:
-  streamlit run streamlit_seedance.py
+  streamlit run app.py
 
 Loads keys from env.json (project root), then process env / .env.
 """
@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
+
+import auth
 
 _ROOT = Path(__file__).resolve().parent
 
@@ -109,6 +111,8 @@ ACTIVE_STATUSES = {
 
 def _init_session() -> None:
     defaults = {
+        "logged_in": False,
+        "username": "",
         "result_video_url": None,
         "result_local_path": None,
         "result_usage": None,
@@ -126,6 +130,25 @@ def _init_session() -> None:
 
 
 _init_session()
+
+# ── Login gate ────────────────────────────────────────────────────────────────
+if not st.session_state.logged_in:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col = st.columns([1, 1, 1])[1]
+    with col:
+        st.title("🎬 Seedance")
+        st.caption("Edit prompt → Video · Sign in to continue")
+        st.divider()
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", type="primary", use_container_width=True):
+            if auth.verify(username, password):
+                st.session_state.logged_in = True
+                st.session_state.username = username
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+    st.stop()
 
 
 def _seedream_ok() -> bool:
@@ -521,6 +544,15 @@ st.caption(
 )
 
 with st.sidebar:
+    st.header("Account")
+    col_user, col_logout = st.columns([2, 1])
+    col_user.caption(f"Logged in as **{st.session_state.username}**")
+    if col_logout.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.rerun()
+
+    st.divider()
     st.header("API")
     ark_ok = bool(ark_api_key())
     gemini_ok = bool(gemini_api_key())
