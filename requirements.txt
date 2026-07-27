@@ -10,8 +10,11 @@ sniffio
 idna
 certifi
 Pillow
+boto3
+google-genai>=1.0.0
+python-dotenv
 
-# LangGraph + Gemini
+# LangGraph + Gemini (legacy bot in app.py)
 langgraph>=0.2.0
 langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
