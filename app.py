@@ -1,663 +1,867 @@
+"""
+Seedance video edit UI (merged).
+
+Flow:
+  user_prompt → edited_prompt (Gemini enhance) → final_prompt → Seedance video
+
+Steps:
+  1. Upload video (+ optional image) and enter user_prompt
+  2. Gemini enhance layer produces edited_prompt, then compose final_prompt
+  3. Upload video → S3 CDN → BytePlus CreateAsset
+  4. Wait 30s for new assets (reuse cached asset_id if same video)
+  5. Submit Seedance with final_prompt and poll until done
+
+Run:
+  streamlit run streamlit_seedance.py
+
+Loads keys from env.json (project root), then process env / .env.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import streamlit as st
-import api
-import auth
-import history
-import dino_game
-import storyboard
 
-MAX_IMAGES = 9
-MAX_AUDIO = 9
-COST_PER_M_STD = 7.0
-COST_PER_M_HD = 7.7
-
-# LangGraph / Gemini chat (“Refine with AI”) — off by default
-ENABLE_PROMPT_BOT = False
+_ROOT = Path(__file__).resolve().parent
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _extract_video_url(result) -> str | None:
-    try:
-        return result.content.video_url
-    except Exception:
-        pass
-    try:
-        return result.content["video_url"]
-    except Exception:
-        pass
-    try:
-        raw = result.model_dump() if hasattr(result, "model_dump") else {}
-        return raw.get("content", {}).get("video_url")
-    except Exception:
-        pass
-    return None
-
-
-def _calculate_cost(tokens: int, resolution: str) -> float:
-    rate = COST_PER_M_HD if resolution == "1080p" else COST_PER_M_STD
-    return (tokens / 1_000_000) * rate
-
-
-def _show_task_error(label: str, error_message: str | None) -> None:
-    """Show Seedance API failure details in the UI."""
-    st.error(label)
-    if error_message:
-        st.code(error_message, language=None)
-
-
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Seedance 2.0 Demo", page_icon="🎬", layout="wide")
-
-st.markdown("""
-<style>
-    #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ── Session state defaults ────────────────────────────────────────────────────
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "active_task" not in st.session_state:
-    st.session_state.active_task = None
-if "show_game" not in st.session_state:
-    st.session_state.show_game = False
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGIN GATE
-# ─────────────────────────────────────────────────────────────────────────────
-if not st.session_state.logged_in:
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    col = st.columns([1, 1, 1])[1]
-    with col:
-        st.title("🎬 Seedance 2.0")
-        st.caption("BytePlus ModelArk · Video Generation")
-        st.divider()
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login", type="primary", width="stretch"):
-            if auth.verify(username, password):
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.rerun()
-            else:
-                st.error("Invalid username or password")
-    st.stop()
-
-# API key loaded from env (never exposed in UI)
-API_KEY = auth.get_api_key()
-
-# ── Polling fragment ──────────────────────────────────────────────────────────
-@st.fragment(run_every=30)
-def _poll():
-    task = st.session_state.get("active_task")
-    if not task or task["status"] in ("succeeded", "failed"):
+def _load_env_json(path: Path = _ROOT / "env.json") -> None:
+    if not path.is_file():
         return
-    import datetime
-    print(f"[POLL] {datetime.datetime.now().strftime('%H:%M:%S')} checking task {task['id']} | current status: {task['status']}")
     try:
-        client = api.get_client(API_KEY)
-        result = api.get_task(client, task["id"])
-        s = result.status
-        print(f"[POLL] API response status: {s} | raw result: {result}")
-        if s == "succeeded":
-            video_url = _extract_video_url(result)
-            print(f"[POLL] succeeded — video_url: {video_url}")
-            tokens = getattr(getattr(result, "usage", None), "total_tokens", None) or 0
-            cost = _calculate_cost(tokens, task.get("resolution", "720p"))
-            st.session_state.active_task.update({"status": "succeeded", "video_url": video_url,
-                                                  "tokens": tokens, "cost": cost})
-            history.update_task(task["id"], "succeeded", video_url, tokens=tokens, cost=cost)
-            st.rerun()
-        elif s == "failed":
-            err_msg = api.extract_task_error(result)
-            print(f"[POLL] task failed | error: {err_msg} | full result: {result}")
-            st.session_state.active_task.update({"status": "failed", "error_message": err_msg})
-            history.update_task(task["id"], "failed", error_message=err_msg)
-            st.rerun()
-        else:
-            print(f"[POLL] still in progress: {s}")
-            st.session_state.active_task["status"] = s
-    except Exception as e:
-        import traceback
-        print(f"[POLL] exception: {e}")
-        traceback.print_exc()
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for key, value in data.items():
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        name = str(key).strip()
+        text = str(value).strip()
+        if not name or not text or name in os.environ:
+            continue
+        os.environ[name] = text
 
-_poll()
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("🎬 Seedance 2.0")
-    col1, col2 = st.columns([2, 1])
-    col1.caption(f"Logged in as **{st.session_state.username}**")
-    if col2.button("Logout"):
-        st.session_state.logged_in = False
-        st.session_state.active_task = None
-        st.rerun()
-    st.divider()
+_load_env_json()
 
-    # ── Active task ───────────────────────────────────────────────────────────
-    st.subheader("Tasks")
-    active = st.session_state.active_task
-    if active:
-        status_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄", "queued": "⏳"}.get(active["status"], "⏳")
-        with st.container(border=True):
-            st.caption(f"Latest · {active['id'][-8:]}")
-            st.markdown(f"**{status_badge} {active['status'].capitalize()}**")
-            if active.get("prompt"):
-                preview = active["prompt"][:80] + ("…" if len(active["prompt"]) > 80 else "")
-                st.caption(f"_{preview}_")
-            if active["status"] == "succeeded":
-                if active.get("video_url"):
-                    st.video(active["video_url"])
-                    st.markdown(f"[Download]({active['video_url']})")
-                    st.code(active["video_url"], language=None)
-                if active.get("cost") is not None:
-                    st.caption(f"Cost: ${active['cost']:.4f} · {active.get('tokens', 0):,} tokens")
-            elif active["status"] == "failed":
-                _show_task_error("Generation failed", active.get("error_message"))
-            else:
-                st.caption("Polling every 30s…")
+try:
+    from dotenv import load_dotenv
 
-    # ── History (auto-polls every 30s) ───────────────────────────────────────
-    @st.fragment(run_every=30)
-    def _sidebar_history():
-        import datetime
-        tasks = history.load(username=st.session_state.username)
-        if not tasks:
-            st.caption("No tasks yet.")
-            return
+    load_dotenv(_ROOT / ".env")
+    load_dotenv()
+except ImportError:
+    pass
 
-        # Auto-poll any pending/running tasks
-        in_progress = [t for t in tasks if t["status"] not in ("succeeded", "failed")]
-        if in_progress:
-            st.caption(f"🔄 Polling {len(in_progress)} task(s) · {datetime.datetime.now().strftime('%H:%M:%S')}")
-            client = api.get_client(API_KEY)
-            changed = False
-            for t in in_progress:
-                try:
-                    result = api.get_task(client, t["id"])
-                    new_status = result.status
-                    t["status"] = new_status
-                    if new_status == "succeeded":
-                        vurl = _extract_video_url(result)
-                        tokens = getattr(getattr(result, "usage", None), "total_tokens", None) or 0
-                        resolution = t.get("settings", {}).get("resolution", "720p")
-                        cost = _calculate_cost(tokens, resolution)
-                        history.update_task(t["id"], new_status, vurl, tokens=tokens, cost=cost)
-                        t["video_url"] = vurl
-                        t["tokens"] = tokens
-                        t["cost"] = cost
-                        changed = True
-                    elif new_status == "failed":
-                        err_msg = api.extract_task_error(result)
-                        history.update_task(t["id"], new_status, error_message=err_msg)
-                        t["error_message"] = err_msg
-                        changed = True
-                    else:
-                        history.update_task(t["id"], new_status)
-                except Exception as e:
-                    import traceback
-                    print(f"[SIDEBAR_POLL] exception for task {t['id']}: {e}")
-                    traceback.print_exc()
-            if changed:
-                st.rerun()
-        else:
-            st.caption("Recent")
+if not (os.environ.get("ARK_API_KEY") or os.environ.get("BYTEPLUS_API_KEY")):
+    if os.environ.get("SEEDREAM_API_KEY"):
+        os.environ["ARK_API_KEY"] = os.environ["SEEDREAM_API_KEY"]
+if not os.environ.get("ARK_BASE_URL") and os.environ.get("SEEDREAM_BASE_URL"):
+    os.environ["ARK_BASE_URL"] = os.environ["SEEDREAM_BASE_URL"]
+if not os.environ.get("SEEDANCE_MODEL") and os.environ.get("VIDEO_SEEDANCE_MODEL"):
+    os.environ["SEEDANCE_MODEL"] = os.environ["VIDEO_SEEDANCE_MODEL"]
 
-        for t in tasks[:10]:
-            s_badge = {"succeeded": "✅", "failed": "❌", "pending": "⏳", "running": "🔄", "queued": "⏳"}.get(t["status"], "❓")
-            with st.expander(f"{s_badge} {t['id'][-12:]}"):
-                st.caption(t["created_at"][:16].replace("T", " "))
-                prompt_preview = t["prompt"][:60] + ("…" if len(t["prompt"]) > 60 else "")
-                st.caption(f"_{prompt_preview}_")
-                if len(t["prompt"]) > 60:
-                    with st.expander("Full prompt"):
-                        st.write(t["prompt"])
+from byteplus_assets import create_asset, create_asset_group, extract_field
+from seedance_streamlit_helpers import (
+    SEEDANCE_MODEL,
+    _extract_task_id,
+    _find_ffmpeg,
+    ark_api_key,
+    create_seedance_task,
+    download_url_to_temp,
+    download_video_to_temp,
+    extract_task_usage,
+    format_task_usage,
+    get_ark_client,
+    is_http_url,
+    poll_task_once,
+    resolve_image_for_api,
+)
+from video_edit_prompt import (
+    GEMINI_MODEL,
+    compose_final_prompt,
+    enhance_user_prompt,
+    gemini_api_key,
+)
 
-                # Input images
-                all_images = t.get("image_paths", []) + [u for u in t.get("image_urls", []) if u.startswith("http")]
-                if all_images:
-                    img_cols = st.columns(min(len(all_images), 3))
-                    for i, src in enumerate(all_images):
-                        try:
-                            img_cols[i % 3].image(src, width="stretch")
-                        except Exception:
-                            pass
+st.set_page_config(page_title="Seedance Edit → Video", page_icon="🎬", layout="wide")
 
-                all_audios = list(t.get("audio_paths", []))
-                all_audios += [
-                    u
-                    for u in (t.get("audio_urls_ref") or [])
-                    if isinstance(u, str) and u.startswith("http")
-                ]
-                legacy_audio = t.get("audio_url_ref")
-                if legacy_audio and isinstance(legacy_audio, str) and legacy_audio.startswith("http"):
-                    all_audios.insert(0, legacy_audio)
-                if all_audios:
-                    st.caption("Reference audio")
-                    for src in all_audios:
-                        try:
-                            st.audio(src)
-                        except Exception:
-                            pass
+POLL_INTERVAL_S = 15
+ASSET_WARMUP_S = 30  # was 120 — new video assets wait 30s before Seedance
+ACTIVE_STATUSES = {
+    "queued",
+    "running",
+    "pending",
+    "processing",
+    "submitted",
+    "in_progress",
+    "preparing",
+}
 
-                # Load video if succeeded but URL missing
-                if t["status"] == "succeeded" and not t.get("video_url"):
-                    st.caption("⚠️ Video URL missing — will retry next poll")
 
-                if t.get("video_url"):
-                    st.video(t["video_url"])
-                    st.markdown(f"[Download]({t['video_url']})")
-                    st.code(t["video_url"], language=None)
-                    if t.get("cost") is not None:
-                        st.caption(f"Cost: ${t['cost']:.4f} · {t.get('tokens', 0):,} tokens")
-                    elif t.get("tokens"):
-                        cost = _calculate_cost(t["tokens"], t.get("settings", {}).get("resolution", "720p"))
-                        st.caption(f"Cost: ${cost:.4f} · {t['tokens']:,} tokens")
+def _init_session() -> None:
+    defaults = {
+        "result_video_url": None,
+        "result_local_path": None,
+        "result_usage": None,
+        "result_task_id": None,
+        "last_error": None,
+        "cached_video_asset": None,
+        "user_prompt": "",
+        "edited_prompt": None,
+        "final_prompt": None,
+        "enhance_tokens": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-                if t["status"] == "failed":
-                    _show_task_error("Generation failed", t.get("error_message"))
 
-                if t["status"] not in ("succeeded", "failed"):
-                    st.caption(f"Status: **{t['status']}** · next check in ~30s")
+_init_session()
 
-    _sidebar_history()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GENERATE TAB
-# ─────────────────────────────────────────────────────────────────────────────
-GEMINI_KEY = auth.get_gemini_key()
+def _seedream_ok() -> bool:
+    return bool(
+        os.getenv("SEEDREAM_ACCESS_KEY", "").strip()
+        and os.getenv("SEEDREAM_SECRET_KEY", "").strip()
+    )
 
-st.header("Generate Video")
 
-# ── Session state for prompt (optional AI-refined value when bot is on) ───────
-if "_final_prompt" not in st.session_state:
-    st.session_state._final_prompt = None
+def _save_upload(uploaded, default_suffix: str) -> Optional[str]:
+    if uploaded is None:
+        return None
+    suffix = Path(uploaded.name).suffix or default_suffix
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    with open(path, "wb") as f:
+        f.write(uploaded.getvalue())
+    return path
 
-layout_main, layout_story = st.columns([2.25, 1], gap="large")
 
-# ── Main column: reference images ───────────────────────────────────────────
-with layout_main:
-    st.subheader(f"Reference Images (up to {MAX_IMAGES})")
-    image_input_mode = st.radio("Image input mode", ["Upload files", "Paste URLs"], horizontal=True, key="img_mode")
-    image_urls: list[str] = []
-    image_paths: list[str] = []
-    uploaded_images = None
-
-    if image_input_mode == "Upload files":
-        uploaded_images = st.file_uploader("Upload images", type=["jpg", "jpeg", "png", "webp"],
-                                           accept_multiple_files=True, label_visibility="collapsed")
-        if uploaded_images:
-            if len(uploaded_images) > MAX_IMAGES:
-                st.warning(f"Only the first {MAX_IMAGES} images will be used.")
-                uploaded_images = uploaded_images[:MAX_IMAGES]
-            cols = st.columns(min(len(uploaded_images), 3))
-            for i, f in enumerate(uploaded_images):
-                cols[i % 3].image(f, width="stretch", caption=f.name)
-            for f in uploaded_images:
-                file_bytes = f.read()
-                image_urls.append(api.file_to_data_uri(file_bytes, f.name))
-                image_paths.append(api.save_upload(file_bytes, f.name))
+def _video_fingerprint(uploaded=None, url_text: str = "", local_path: Optional[str] = None) -> str:
+    h = hashlib.sha256()
+    if uploaded is not None:
+        h.update(uploaded.getvalue())
+    elif local_path and os.path.isfile(local_path):
+        with open(local_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
     else:
-        st.caption("One URL per line, up to 9")
-        raw_urls = st.text_area("Image URLs", height=100, label_visibility="collapsed",
-                                placeholder="https://example.com/image1.jpg", key="raw_urls")
-        if raw_urls.strip():
-            image_urls = [u.strip() for u in raw_urls.strip().splitlines() if u.strip()][:MAX_IMAGES]
-            if image_urls:
-                cols = st.columns(min(len(image_urls), 3))
-                for i, url in enumerate(image_urls):
-                    try:
-                        cols[i % 3].image(url, width="stretch")
-                    except Exception:
-                        cols[i % 3].caption(f"Image {i+1} (preview unavailable)")
+        h.update((url_text or "").strip().encode("utf-8"))
+    return h.hexdigest()
 
-# ── Side panel: Storyboard (OpenAI gpt-image-2) ───────────────────────────────
-with layout_story:
-    with st.container(border=True):
-        st.subheader("Storyboard")
-        st.caption(
-            f"OpenAI **images.edit** (`gpt-image-2`) using up to **{storyboard.MAX_STORYBOARD_IMAGES}** "
-            "storyboard source images below (separate from video reference images). "
-            "Set `OPENAI_API_KEY` in `env.json`."
+
+VIDEO_MIME = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
+
+
+def _env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _video_upload_config() -> Dict[str, str]:
+    return {
+        "access_key": _env("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+        "secret_key": _env("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+        "bucket": _env("S3_BUCKET", "AWS_S3_BUCKET", "BUCKET_NAME"),
+        "region": _env("S3_REGION", "AWS_DEFAULT_REGION", "AWS_REGION", default="us-east-1"),
+        "endpoint": _env("S3_ENDPOINT", "AWS_ENDPOINT_URL"),
+        "cdn_base": _env(
+            "VIDEO_CDN_BASE_URL",
+            "CDN_BASE_URL",
+            default="https://d13wztgkh59qmm.cloudfront.net",
+        ),
+        "tenant_id": _env("TENANT_ID", default="streamlit"),
+        "resolution": _env("VIDEO_UPLOAD_RESOLUTION", default="720p"),
+    }
+
+
+def _s3_ok() -> bool:
+    cfg = _video_upload_config()
+    return bool(cfg["access_key"] and cfg["secret_key"] and cfg["bucket"] and cfg["cdn_base"])
+
+
+def _s3_missing() -> List[str]:
+    cfg = _video_upload_config()
+    return [
+        name
+        for name, value in (
+            ("S3_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID", cfg["access_key"]),
+            ("S3_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY", cfg["secret_key"]),
+            ("S3_BUCKET", cfg["bucket"]),
+            ("VIDEO_CDN_BASE_URL", cfg["cdn_base"]),
         )
-        OPENAI_KEY = auth.get_openai_key()
-        sb_images = st.file_uploader(
-            f"Storyboard source images (up to {storyboard.MAX_STORYBOARD_IMAGES})",
-            type=["jpg", "jpeg", "png", "webp"],
-            accept_multiple_files=True,
-            help="These images are sent to OpenAI as references — not the same as Reference Images for video.",
-            key="sb_source_image",
-            label_visibility="visible",
+        if not value
+    ]
+
+
+def _build_s3_key(*, tenant_id: str, batch_id: str, resolution: str, suffix: str = ".mp4") -> str:
+    from datetime import datetime, timezone
+    import uuid as _uuid
+
+    now = datetime.now(timezone.utc)
+    year, month = now.strftime("%Y"), now.strftime("%m")
+    file_id = str(_uuid.uuid4())
+    return f"video/{year}/{month}/{tenant_id}/{batch_id}/{resolution}/{file_id}.mp4"
+
+
+def _remux_h264_mp4(input_path: str) -> tuple[str, Optional[str]]:
+    import subprocess
+
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return input_path, None
+
+    fd, out_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    cmd = [
+        ffmpeg, "-y", "-i", input_path, "-t", "15",
+        "-vf",
+        "scale='min(1280,iw)':min(720,ih):force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-r", "24", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", out_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "ffmpeg failed to remux H.264 MP4: "
+            + (proc.stderr.strip() or proc.stdout.strip() or "unknown error")
         )
-        if sb_images:
-            if len(sb_images) > storyboard.MAX_STORYBOARD_IMAGES:
-                st.warning(f"Only the first {storyboard.MAX_STORYBOARD_IMAGES} images will be used.")
-                sb_images = sb_images[: storyboard.MAX_STORYBOARD_IMAGES]
-            cols = st.columns(min(len(sb_images), 3))
-            for i, f in enumerate(sb_images):
-                cols[i % 3].image(f, width="stretch", caption=f.name)
-        if "sb_prompt" not in st.session_state:
-            st.session_state.sb_prompt = storyboard.DEFAULT_STORYBOARD_PROMPT
-        sb_prompt = st.text_area("Storyboard prompt", height=160, key="sb_prompt")
-        sb_quality = st.selectbox("Quality", ["low", "medium", "high"], index=1, key="sb_quality")
-        sb_size = st.selectbox("Size", ["1024x1024", "1024x1536", "1536x1024"], index=0, key="sb_size")
-        create_sb = st.button("Create story board", type="secondary", width="stretch", key="create_storyboard")
+    return out_path, out_path
 
-        if create_sb:
-            if not OPENAI_KEY or OPENAI_KEY == "your-openai-api-key-here":
-                st.error("Add a valid `OPENAI_API_KEY` to `env.json`.")
-            elif not sb_prompt.strip():
-                st.error("Enter a storyboard prompt.")
-            else:
-                loaded = storyboard.load_storyboard_uploads(sb_images)
-                if not loaded:
-                    st.error(
-                        f"Upload at least one **Storyboard source image** "
-                        f"(up to {storyboard.MAX_STORYBOARD_IMAGES}, separate from video reference images)."
-                    )
-                else:
-                    with st.spinner("Creating storyboard image…"):
-                        try:
-                            out = storyboard.generate_storyboard_image(
-                                OPENAI_KEY,
-                                loaded,
-                                sb_prompt,
-                                quality=sb_quality,
-                                size=sb_size,
-                            )
-                            st.session_state["_storyboard_png"] = out
-                        except Exception as e:
-                            st.session_state["_storyboard_png"] = None
-                            st.error(f"Storyboard failed: {e}")
 
-        if st.session_state.get("_storyboard_png"):
-            st.image(st.session_state["_storyboard_png"], caption="Storyboard result", width="stretch")
-            st.download_button(
-                label="Download storyboard PNG",
-                data=st.session_state["_storyboard_png"],
-                file_name="storyboard.png",
-                mime="image/png",
-                key="download_storyboard",
-            )
+def _upload_via_s3(
+    local_path: str,
+    *,
+    resolution: Optional[str] = None,
+    status_write=None,
+) -> Dict[str, Any]:
+    try:
+        import boto3
+        import uuid as _uuid
+    except ImportError as e:
+        raise RuntimeError("Install boto3: pip install boto3") from e
 
-# ── Main column (continued): bot, prompt, generate ───────────────────────────
-with layout_main:
-    st.divider()
+    missing = _s3_missing()
+    if missing:
+        raise RuntimeError("Missing video upload env: " + ", ".join(missing))
 
-    # ── Chat interface (Gemini / LangGraph) — optional ─────────────────────────
-    if ENABLE_PROMPT_BOT:
-        import re
+    cfg = _video_upload_config()
+    path = Path(local_path)
+    if not path.is_file():
+        raise FileNotFoundError(local_path)
 
-        import bot as bot_module
+    res = (resolution or cfg["resolution"] or "720p").lower()
+    key = _build_s3_key(
+        tenant_id=cfg["tenant_id"] or "streamlit",
+        batch_id=str(_uuid.uuid4()),
+        resolution=res,
+    )
+    log = status_write or (lambda _msg: None)
+    size_mb = path.stat().st_size / (1024 * 1024)
 
-        if "_bot_thread_suffix" not in st.session_state:
-            st.session_state._bot_thread_suffix = "0"
-        thread_id = f"{st.session_state.username}_prompt_{st.session_state._bot_thread_suffix}"
+    client_kwargs: Dict[str, Any] = {
+        "service_name": "s3",
+        "region_name": cfg["region"] or "us-east-1",
+        "aws_access_key_id": cfg["access_key"],
+        "aws_secret_access_key": cfg["secret_key"],
+    }
+    if cfg["endpoint"]:
+        client_kwargs["endpoint_url"] = cfg["endpoint"]
 
-        st.subheader("Refine with AI")
-        st.caption("Describe your video idea — the bot will help craft a production-ready Seedance prompt.")
-
-        if not GEMINI_KEY or GEMINI_KEY == "your-gemini-api-key-here":
-            st.warning("Add your `GEMINI_API_KEY` to `env.json` to use the bot.")
-            st.stop()
-
-        history_msgs = bot_module.get_history(GEMINI_KEY, thread_id)
-
-        chat_container = st.container(height=450)
-        with chat_container:
-            if not history_msgs:
-                st.markdown(
-                    """
-                    <div style='text-align:center; padding: 60px 20px; color: #888;'>
-                        <div style='font-size: 40px'>🎬</div>
-                        <div style='font-size: 16px; margin-top: 12px'>Tell me what you want to create.</div>
-                        <div style='font-size: 13px; margin-top: 6px'>Share a product, mood, brand reference — anything.</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            for msg in history_msgs:
-                with st.chat_message(msg["role"]):
-                    content = msg["content"]
-                    prompts = bot_module.extract_prompts(content)
-                    if prompts and msg["role"] == "assistant":
-                        display = re.sub(r"<PROMPT>.*?</PROMPT>", "", content, flags=re.DOTALL).strip()
-                        if display:
-                            st.markdown(display)
-                        for i, p in enumerate(prompts):
-                            st.markdown("**Generated Prompt:**")
-                            st.code(p, language=None)
-                            btn_key = f"use_prompt_{hash(p)}_{i}"
-                            if st.button("→ Use this prompt", key=btn_key, type="primary"):
-                                st.session_state._final_prompt = p
-                                st.rerun()
-                    else:
-                        st.markdown(content)
-
-            user_input = st.chat_input("Describe your video idea…")
-
-        if user_input:
-            print(f"[APP] user_input received: {user_input[:50]}...")
-            print(f"[APP] image_input_mode: {image_input_mode}")
-            print(f"[APP] uploaded_images: {uploaded_images}")
-
-            img_bytes_list = []
-            if image_input_mode == "Upload files" and uploaded_images:
-                for f in uploaded_images:
-                    f.seek(0)
-                    img_bytes_list.append(f.read())
-            print(f"[APP] img_bytes_list length: {len(img_bytes_list)}")
-            print(f"[APP] thread_id: {thread_id}")
-
-            with st.spinner("Thinking…"):
-                try:
-                    print("[APP] calling bot_module.chat...")
-                    bot_module.chat(GEMINI_KEY, user_input, img_bytes_list, thread_id)
-                    print("[APP] bot_module.chat completed successfully")
-                    st.rerun()
-                except Exception as e:
-                    print(f"[APP] bot error: {e}")
-                    import traceback
-
-                    traceback.print_exc()
-                    st.error(f"Bot error: {e}")
-
-        if history_msgs:
-            if st.button("🗑 Clear conversation", type="secondary", width="stretch"):
-                import time as _time
-
-                st.session_state._bot_thread_suffix = str(int(_time.time()))
-                st.rerun()
-
-        st.divider()
-
-    # ── Prompt display and generation settings ────────────────────────────────
-    col_left, col_right = st.columns([1, 1], gap="large")
-
-    with col_left:
-        st.subheader("Prompt")
-        if st.session_state._final_prompt:
-            st.info("✨ Using AI-refined prompt")
-            st.code(st.session_state._final_prompt, language=None)
-            st.caption("Or override with manual prompt below:")
-        final_prompt = st.text_area(
-            "Manual prompt",
-            height=80,
-            label_visibility="collapsed",
-            value=st.session_state._final_prompt or "Create a cinematic video using this scene",
-            key="_manual_prompt",
+    log(f"Uploading to S3 (`{key}`, {size_mb:.2f} MB)…")
+    client = boto3.client(**client_kwargs)
+    with path.open("rb") as handle:
+        client.put_object(
+            Bucket=cfg["bucket"],
+            Key=key,
+            Body=handle,
+            ContentType="video/mp4",
+            ContentDisposition='inline; filename="seedance_reference.mp4"',
         )
-        if final_prompt != st.session_state._final_prompt:
-            final_prompt_to_use = final_prompt
-        else:
-            final_prompt_to_use = st.session_state._final_prompt or final_prompt
 
-        st.subheader("Reference Video (optional)")
-        video_input_mode = st.radio(
-            "Video input mode", ["Upload file", "Paste URL"], horizontal=True, key="vid_mode"
+    url = f"{cfg['cdn_base'].rstrip('/')}/{key}"
+    if not is_http_url(url):
+        raise RuntimeError(f"Invalid CDN URL built: {url}")
+    log(f"CDN URL: `{url}`")
+    return {"mp4_url": url, "key": key, "size_mb": round(size_mb, 2), "resolution": res}
+
+
+def upload_video_for_create_asset(
+    local_path: str,
+    *,
+    resolution: Optional[str] = None,
+    status_write=None,
+) -> tuple[str, str, Dict[str, Any]]:
+    details = _upload_via_s3(local_path, resolution=resolution, status_write=status_write)
+    return details["mp4_url"], "s3_cdn", details
+
+
+def prepare_video_public_url_for_asset(
+    *,
+    local_path: Optional[str],
+    url_text: str,
+    resolution: Optional[str] = None,
+    status_write=None,
+    force_h264: bool = False,
+) -> tuple[str, Dict[str, Any]]:
+    url_text = (url_text or "").strip()
+    cleanup: List[str] = []
+    stats: Dict[str, Any] = {}
+    log = status_write or (lambda _msg: None)
+
+    try:
+        source = local_path
+        if not source and is_http_url(url_text):
+            suffix = Path(url_text.split("?", 1)[0]).suffix.lower() or ".mp4"
+            source = download_url_to_temp(url_text, suffix=suffix)
+            cleanup.append(source)
+        if not source or not os.path.isfile(source):
+            raise RuntimeError("No local video to register as asset.")
+
+        if force_h264:
+            log("Remuxing to H.264 MP4 for CreateAsset…")
+            remuxed, temp = _remux_h264_mp4(source)
+            if temp:
+                cleanup.append(temp)
+                stats["converted_h264"] = True
+            source = remuxed
+
+        size_mb = os.path.getsize(source) / (1024 * 1024)
+        stats["size_mb"] = round(size_mb, 2)
+        if size_mb >= 50:
+            stats["size_warning"] = "Video >= 50 MB — CreateAsset may reject it."
+
+        public_url, method, details = upload_video_for_create_asset(
+            source, resolution=resolution, status_write=status_write
         )
-        ref_video_url: str | None = None
-
-        if video_input_mode == "Upload file":
-            uploaded_video = st.file_uploader(
-                "Upload video", type=["mp4", "mov", "avi", "webm"], label_visibility="collapsed"
-            )
-            if uploaded_video:
-                st.video(uploaded_video)
-                ref_video_url = api.file_to_data_uri(uploaded_video.read(), uploaded_video.name)
-        else:
-            v_url = st.text_input(
-                "Video URL",
-                placeholder="https://example.com/video.mp4",
-                label_visibility="collapsed",
-            )
-            if v_url.strip():
-                ref_video_url = v_url.strip()
-
-        st.subheader(f"Reference Audio (optional, up to {MAX_AUDIO})")
-        audio_input_mode = st.radio(
-            "Audio input mode", ["Upload files", "Paste URLs"], horizontal=True, key="aud_mode"
-        )
-        ref_audio_urls: list[str] = []
-        audio_paths: list[str] = []
-
-        if audio_input_mode == "Upload files":
-            uploaded_audios = st.file_uploader(
-                "Upload audio",
-                type=["mp3", "wav", "aac", "m4a"],
-                accept_multiple_files=True,
-                label_visibility="collapsed",
-            )
-            if uploaded_audios:
-                if len(uploaded_audios) > MAX_AUDIO:
-                    st.warning(f"Only the first {MAX_AUDIO} audio files will be used.")
-                    uploaded_audios = uploaded_audios[:MAX_AUDIO]
-                for f in uploaded_audios:
-                    st.caption(f.name)
-                    st.audio(f)
-                for f in uploaded_audios:
-                    f.seek(0)
-                    file_bytes = f.read()
-                    ref_audio_urls.append(api.file_to_data_uri(file_bytes, f.name))
-                    audio_paths.append(api.save_upload(file_bytes, f.name))
-        else:
-            st.caption("One URL per line")
-            raw_audio_urls = st.text_area(
-                "Audio URLs",
-                height=80,
-                label_visibility="collapsed",
-                placeholder="https://example.com/track1.mp3",
-                key="raw_audio_urls",
-            )
-            if raw_audio_urls.strip():
-                ref_audio_urls = [
-                    u.strip()
-                    for u in raw_audio_urls.strip().splitlines()
-                    if u.strip()
-                ][:MAX_AUDIO]
-
-    with col_right:
-        st.subheader("Settings")
-        ratio = st.selectbox("Aspect ratio", ["16:9", "9:16", "1:1", "4:3", "3:4"])
-        resolution = st.selectbox("Resolution", ["1080p", "720p", "480p"])
-        duration = st.number_input("Duration (seconds)", min_value=3, max_value=15, value=5, step=1)
-        generate_audio = st.toggle("Generate audio", value=True)
-        watermark = st.toggle("Watermark", value=False)
-
-        st.divider()
-        st.caption(f"Images: {len(image_urls)} / {MAX_IMAGES}")
-        st.caption(f"Video ref: {'yes' if ref_video_url else 'none'}")
-        st.caption(f"Audio ref: {len(ref_audio_urls)} / {MAX_AUDIO}")
-        rate = COST_PER_M_HD if resolution == "1080p" else COST_PER_M_STD
-        st.caption(f"Billing rate: ${rate}/M tokens")
-        st.divider()
-
-        submit = st.button("🚀 Generate", type="primary", width="stretch")
-
-    if "flash" in st.session_state:
-        st.success(st.session_state.pop("flash"))
-
-    active_check = st.session_state.get("active_task")
-    if (
-        active_check
-        and active_check["status"] not in ("succeeded", "failed")
-        and not st.session_state.show_game
-    ):
-        if st.button("🦕 Open dino game", width="stretch"):
-            st.session_state.show_game = True
-            st.rerun()
-
-    active = st.session_state.get("active_task")
-    if st.session_state.show_game and active and active["status"] not in ("succeeded", "failed"):
-        st.markdown("<div id='dino-section'></div>", unsafe_allow_html=True)
-        st.markdown("---")
-        col_title, col_close = st.columns([4, 1])
-        col_title.subheader("🦕 Dino Game — task is still running in the background")
-        if col_close.button("✕ Back to app", type="primary"):
-            st.session_state.show_game = False
-            st.rerun()
-        dino_game.render(height=230)
-        st.caption("Space / ↑ to jump · ↓ to duck · Your video is being generated in the sidebar")
-        import streamlit.components.v1 as components
-
-        components.html(
-            "<script>window.parent.document.getElementById('dino-section')?.scrollIntoView({behavior:'smooth'});</script>",
-            height=0,
-        )
-    elif st.session_state.show_game:
-        st.session_state.show_game = False
-
-    if submit:
-        if not image_urls:
-            st.error("Please provide at least one reference image.")
-        elif not final_prompt_to_use.strip():
-            st.error("Please enter or select a prompt.")
-        else:
-            settings = {
-                "ratio": ratio,
-                "resolution": resolution,
-                "duration": int(duration),
-                "generate_audio": generate_audio,
-                "watermark": watermark,
-            }
-            client = api.get_client(API_KEY)
+        stats["upload_method"] = method
+        stats["public_url"] = public_url
+        stats["mp4_url"] = public_url
+        stats["size_mb"] = details.get("size_mb", stats["size_mb"])
+        stats["local_source"] = source
+        return public_url, stats
+    finally:
+        for p in cleanup:
             try:
-                task = api.create_task(
-                    client,
-                    prompt=final_prompt_to_use,
-                    image_urls=image_urls,
-                    video_url=ref_video_url,
-                    audio_urls=ref_audio_urls,
-                    **settings,
-                )
-                task_id = task["id"]
-                st.session_state.active_task = {
-                    "id": task_id,
-                    "status": "pending",
-                    "video_url": None,
-                    "cost": None,
-                    "tokens": None,
-                    "resolution": resolution,
-                    "prompt": final_prompt_to_use,
-                }
-                history.add_task(
-                    task_id,
-                    final_prompt_to_use,
-                    image_urls,
-                    image_paths,
-                    ref_video_url,
-                    ref_audio_urls,
-                    audio_paths,
-                    settings,
-                    username=st.session_state.username,
-                )
-                st.session_state["flash"] = f"Task submitted: `{task_id}`"
-                st.session_state.show_game = True
-                st.rerun()
-            except Exception as e:
-                err_detail = api.format_api_exception(e)
-                print(f"[APP] create_task failed: {err_detail}")
-                _show_task_error("Failed to create task", err_detail)
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
 
+
+def register_video_asset(
+    public_url: str,
+    *,
+    group_name: str = "streamlit-seedance-video",
+    group_description: str = "Streamlit uploaded reference video",
+    group_type: str = "AIGC",
+) -> Dict[str, str]:
+    group_resp = create_asset_group(
+        name=group_name,
+        description=group_description,
+        group_type=group_type,
+    )
+    group_id = extract_field(group_resp, "GroupId", "Id", "GroupID")
+    try:
+        asset_resp = create_asset(
+            group_id=group_id,
+            url=public_url,
+            asset_type="Video",
+            name="seedance_reference.mp4",
+        )
+    except Exception as e:
+        err = str(e)
+        if "FormatUnsupported" in err or "Unsupported media format" in err:
+            raise RuntimeError(
+                "CreateAsset rejected the video format. "
+                "BytePlus Video assets require MP4/MOV (H.264), ≤50MB, ~2–15s, 480p/720p. "
+                f"URL tried: {public_url}. Original error: {err}"
+            ) from e
+        raise
+    try:
+        asset_id = extract_field(asset_resp, "AssetId", "Id", "AssetID")
+    except RuntimeError:
+        asset_id = (
+            (asset_resp.get("Result") or {}).get("Id")
+            or (asset_resp.get("Result") or {}).get("AssetId")
+            or ""
+        )
+    if not asset_id:
+        raise RuntimeError(f"CreateAsset returned no asset id: {asset_resp}")
+    return {
+        "public_url": public_url,
+        "asset_id": asset_id,
+        "group_id": group_id,
+        "asset_url": f"asset://{asset_id}",
+    }
+
+
+def _wait_for_asset_warmup(status_box, *, seconds: int = ASSET_WARMUP_S) -> None:
+    status_box.write(f"New video asset registered — waiting {seconds}s before Seedance…")
+    progress = status_box.progress(0.0)
+    for elapsed in range(1, seconds + 1):
+        remaining = seconds - elapsed
+        if remaining % 5 == 0 or remaining <= 3:
+            status_box.write(f"Seedance in {remaining}s…")
+        progress.progress(elapsed / seconds)
+        time.sleep(1)
+    status_box.write("Wait complete — submitting to Seedance.")
+
+
+def build_content(
+    prompt: str,
+    *,
+    video_ref: str,
+    image_url: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image_url:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image_url},
+                "role": "reference_image",
+            }
+        )
+    content.append(
+        {
+            "type": "video_url",
+            "video_url": {"url": video_ref},
+            "role": "reference_video",
+        }
+    )
+    return content
+
+
+def poll_until_done(task_id: str, status_box) -> Dict[str, Any]:
+    client = get_ark_client()
+    while True:
+        status, raw, video_url, usage = poll_task_once(client, task_id)
+        status_box.write(f"Status: `{status}`")
+        if status == "succeeded":
+            return {
+                "status": status,
+                "raw": raw,
+                "video_url": video_url,
+                "usage": usage or extract_task_usage(raw),
+            }
+        if status == "failed":
+            err = getattr(raw, "error", None) or getattr(raw, "message", None) or str(raw)
+            raise RuntimeError(f"Seedance task failed: {err}")
+        if status not in ACTIVE_STATUSES and status != "unknown":
+            status_box.write(f"Unexpected status `{status}` — still polling…")
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _materialize_media(
+    *,
+    uploaded_video,
+    video_url_text: str,
+    uploaded_image,
+    image_url_text: str,
+) -> tuple[Optional[str], Optional[str], List[str]]:
+    """Save uploads / download URLs to temp files. Returns (video_path, image_path, cleanup)."""
+    cleanup: List[str] = []
+    video_path = _save_upload(uploaded_video, ".mp4") if uploaded_video else None
+    if video_path:
+        cleanup.append(video_path)
+    elif (video_url_text or "").strip():
+        url = video_url_text.strip()
+        suffix = Path(url.split("?", 1)[0]).suffix.lower() or ".mp4"
+        fd, video_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        urllib.request.urlretrieve(url, video_path)
+        cleanup.append(video_path)
+
+    image_path = _save_upload(uploaded_image, ".png") if uploaded_image else None
+    if image_path:
+        cleanup.append(image_path)
+    elif (image_url_text or "").strip().startswith(("http://", "https://")):
+        url = image_url_text.strip()
+        suffix = Path(url.split("?", 1)[0]).suffix.lower() or ".png"
+        fd, image_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        urllib.request.urlretrieve(url, image_path)
+        cleanup.append(image_path)
+
+    return video_path, image_path, cleanup
+
+
+# --- UI ---
+st.title("Seedance — Edit Prompt → Video")
+st.caption(
+    f"Flow: **user_prompt → edited_prompt → final_prompt → video** · "
+    f"Model `{SEEDANCE_MODEL}` · Enhance `{GEMINI_MODEL}` · Asset warmup `{ASSET_WARMUP_S}s`"
+)
+
+with st.sidebar:
+    st.header("API")
+    ark_ok = bool(ark_api_key())
+    gemini_ok = bool(gemini_api_key())
+    seedream_ok = _seedream_ok()
+    s3_ok = _s3_ok()
+    st.write(f"Gemini (enhance): {'✅' if gemini_ok else '❌'}")
+    st.write(f"ARK (Seedance): {'✅' if ark_ok else '❌'}")
+    st.write(f"Seedream (asset): {'✅' if seedream_ok else '❌'}")
+    st.write(f"S3 + video CDN: {'✅' if s3_ok else '❌'}")
+    if not gemini_ok:
+        st.caption("Set `GEMINI_API_KEY`.")
+    if not ark_ok:
+        st.caption("Set `ARK_API_KEY` or `BYTEPLUS_API_KEY`.")
+    if not seedream_ok:
+        st.caption("Set `SEEDREAM_ACCESS_KEY` and `SEEDREAM_SECRET_KEY`.")
+    if not s3_ok:
+        st.caption("Missing: " + (", ".join(_s3_missing()) or "S3 config"))
+    else:
+        cfg = _video_upload_config()
+        st.caption(f"CDN `{cfg['cdn_base']}` · bucket `{cfg['bucket']}`")
+
+    st.divider()
+    st.header("Parameters")
+    edit_mode = st.radio(
+        "Edit workflow",
+        options=["General edit", "Replace item or avatar"],
+        help="General edit: add/remove/modify/dialogue/background. Replace: product/prop/avatar swap.",
+    )
+    gemini_model = st.text_input("Gemini enhance model", value=GEMINI_MODEL)
+    ratio = st.selectbox("Aspect ratio", ["16:9", "9:16", "1:1", "4:3", "3:4"], index=0)
+    duration = st.slider("Duration (seconds)", 4, 15, 10)
+    resolution = st.selectbox("Seedance resolution", ["1080p", "720p", "480p"], index=0)
+    generate_audio = False
+    skip_warmup = st.checkbox(
+        f"Skip {ASSET_WARMUP_S}s asset warmup",
+        value=False,
+        help="Only skip if this video asset was already registered and is ready.",
+    )
+
+    cached = st.session_state.cached_video_asset
+    if cached and cached.get("asset_id"):
+        st.divider()
+        st.caption("Cached video asset (same video → reuse, no warmup)")
+        st.code(cached["asset_id"], language=None)
+
+col_in, col_out = st.columns(2)
+
+with col_in:
+    st.subheader("1 · Input")
+    uploaded_video = st.file_uploader(
+        "Video 1 — source video (required)",
+        type=["mp4", "mov", "webm"],
+        key="video_uploader",
+    )
+    video_url_text = st.text_input("Or Video 1 URL", placeholder="https://...mp4")
+    if uploaded_video:
+        st.video(uploaded_video)
+
+    uploaded_image = st.file_uploader(
+        "Image 1 — reference (optional)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="image_uploader",
+    )
+    image_url_text = st.text_input("Or Image 1 URL (optional)", placeholder="https://...")
+    if uploaded_image:
+        st.image(uploaded_image, caption="Image 1", use_container_width=True)
+
+    user_prompt = st.text_area(
+        "User prompt",
+        height=140,
+        placeholder=(
+            "e.g. Remove the cup after the person places it on the table, or replace "
+            "the product in Video 1 with Image 1."
+        ),
+        key="user_prompt_input",
+    )
+
+    generate = st.button(
+        "Enhance prompt → Generate video",
+        type="primary",
+        use_container_width=True,
+    )
+
+with col_out:
+    st.subheader("2 · Prompt pipeline & output")
+
+    if generate:
+        st.session_state.last_error = None
+        st.session_state.result_video_url = None
+        st.session_state.result_local_path = None
+        st.session_state.result_usage = None
+        st.session_state.result_task_id = None
+        st.session_state.edited_prompt = None
+        st.session_state.final_prompt = None
+        st.session_state.enhance_tokens = None
+
+        has_video = bool(uploaded_video) or bool((video_url_text or "").strip())
+        if not (user_prompt or "").strip():
+            st.warning("Enter a user prompt.")
+        elif not has_video:
+            st.warning("Upload a video or paste a video URL.")
+        elif not gemini_ok:
+            st.error("Missing GEMINI_API_KEY.")
+        elif not ark_ok:
+            st.error("Missing ARK_API_KEY or BYTEPLUS_API_KEY.")
+        elif not seedream_ok:
+            st.error("Missing SEEDREAM_ACCESS_KEY / SEEDREAM_SECRET_KEY.")
+        elif not s3_ok:
+            st.error("Missing S3 env: " + ", ".join(_s3_missing()))
+        else:
+            video_path = None
+            image_path = None
+            cleanup: List[str] = []
+            try:
+                video_path, image_path, cleanup = _materialize_media(
+                    uploaded_video=uploaded_video,
+                    video_url_text=video_url_text or "",
+                    uploaded_image=uploaded_image,
+                    image_url_text=image_url_text or "",
+                )
+                if not video_path or not os.path.isfile(video_path):
+                    raise RuntimeError("Could not prepare Video 1.")
+
+                st.session_state.user_prompt = user_prompt.strip()
+
+                # ── Step A: enhance ──────────────────────────────────────────
+                with st.status("Step 1 — Enhance: user_prompt → edited_prompt", expanded=True) as s_enh:
+                    s_enh.write(f"Model: `{gemini_model}` · workflow: `{edit_mode}`")
+                    s_enh.write("Uploading Video 1 to Gemini…")
+                    if image_path:
+                        s_enh.write("Including Image 1…")
+                    edited_prompt, token_info = enhance_user_prompt(
+                        video_path=video_path,
+                        image_path=image_path,
+                        user_prompt=user_prompt.strip(),
+                        edit_mode=edit_mode,
+                        model=(gemini_model or GEMINI_MODEL).strip(),
+                    )
+                    st.session_state.edited_prompt = edited_prompt
+                    st.session_state.enhance_tokens = token_info
+                    final_prompt = compose_final_prompt(
+                        edit_mode=edit_mode,
+                        edited_prompt=edited_prompt,
+                        user_prompt=user_prompt.strip(),
+                    )
+                    st.session_state.final_prompt = final_prompt
+                    s_enh.write("edited_prompt ready → composed final_prompt")
+                    s_enh.update(label="Enhance complete", state="complete")
+
+                st.markdown("##### user_prompt")
+                st.code(st.session_state.user_prompt, language=None)
+                st.markdown("##### edited_prompt")
+                st.code(st.session_state.edited_prompt, language=None)
+                st.markdown("##### final_prompt (sent to Seedance)")
+                st.code(st.session_state.final_prompt, language=None)
+                if st.session_state.enhance_tokens:
+                    ti = st.session_state.enhance_tokens
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Enhance prompt tokens", ti.get("prompt_tokens") or "—")
+                    c2.metric("Enhance output tokens", ti.get("output_tokens") or "—")
+                    c3.metric("Enhance total", ti.get("total_tokens") or "—")
+
+                prompt_for_seedance = (st.session_state.final_prompt or "").strip()
+                if not prompt_for_seedance:
+                    raise RuntimeError("final_prompt is empty.")
+
+                video_hash = _video_fingerprint(
+                    uploaded=uploaded_video,
+                    url_text=(video_url_text or "").strip(),
+                    local_path=video_path,
+                )
+                cached = st.session_state.cached_video_asset
+                video_changed = (
+                    cached is None
+                    or cached.get("video_hash") != video_hash
+                    or not cached.get("asset_id")
+                )
+
+                # ── Step B: asset ────────────────────────────────────────────
+                with st.status("Step 2 — S3 CDN upload → CreateAsset", expanded=True) as s1:
+                    if video_changed:
+                        s1.write("Uploading video to S3…")
+                        public_url, vid_stats = prepare_video_public_url_for_asset(
+                            local_path=video_path,
+                            url_text=(video_url_text or "").strip(),
+                            status_write=s1.write,
+                            force_h264=False,
+                        )
+                        if not public_url:
+                            raise RuntimeError("Could not prepare reference video.")
+                        s1.write(f"CDN URL: `{public_url}`")
+                        if vid_stats.get("size_mb") is not None:
+                            s1.write(f"Size: `{vid_stats['size_mb']} MB`")
+                        if vid_stats.get("size_warning"):
+                            s1.warning(vid_stats["size_warning"])
+
+                        s1.write("CreateAssetGroup + CreateAsset (Video)…")
+                        try:
+                            asset_info = register_video_asset(public_url)
+                        except RuntimeError as e:
+                            if "FormatUnsupported" not in str(e) and "Unsupported media format" not in str(e):
+                                raise
+                            s1.warning("CreateAsset rejected format — remuxing H.264 and retrying…")
+                            public_url, vid_stats = prepare_video_public_url_for_asset(
+                                local_path=video_path,
+                                url_text=(video_url_text or "").strip(),
+                                status_write=s1.write,
+                                force_h264=True,
+                            )
+                            s1.write(f"Retry CDN URL: `{public_url}`")
+                            asset_info = register_video_asset(public_url)
+
+                        s1.write(f"Asset ID: `{asset_info['asset_id']}`")
+                        st.session_state.cached_video_asset = {
+                            "video_hash": video_hash,
+                            **asset_info,
+                        }
+                        s1.update(label="Video asset registered", state="complete")
+                    else:
+                        asset_info = {
+                            "asset_id": cached["asset_id"],
+                            "group_id": cached.get("group_id", ""),
+                            "public_url": cached.get("public_url", ""),
+                            "asset_url": cached.get("asset_url")
+                            or f"asset://{cached['asset_id']}",
+                        }
+                        s1.write(f"Same video — reusing asset `{asset_info['asset_id']}`")
+                        s1.update(label="Cached video asset reused", state="complete")
+
+                if video_changed and not skip_warmup:
+                    with st.status(
+                        f"Step 3 — Wait {ASSET_WARMUP_S}s for asset readiness",
+                        expanded=True,
+                    ) as s_wait:
+                        _wait_for_asset_warmup(s_wait)
+                        s_wait.update(label="Asset warmup complete", state="complete")
+                elif video_changed and skip_warmup:
+                    st.caption(f"Skipped {ASSET_WARMUP_S}s warmup.")
+                else:
+                    st.caption("Skipped warmup — cached asset reused.")
+
+                image_url = None
+                if uploaded_image or (image_url_text or "").strip():
+                    with st.status("Prepare optional reference image", expanded=True) as s_img:
+                        image_url, img_stats = resolve_image_for_api(
+                            image_path,
+                            (image_url_text or "").strip(),
+                            uploaded_bytes=uploaded_image.getvalue() if uploaded_image else None,
+                        )
+                        if not image_url:
+                            raise RuntimeError("Could not prepare reference image.")
+                        s_img.write(f"Image URL: `{image_url}`")
+                        s_img.update(label="Reference image ready", state="complete")
+
+                content = build_content(
+                    prompt_for_seedance,
+                    video_ref=asset_info["asset_url"],
+                    image_url=image_url,
+                )
+
+                # ── Step C: Seedance ─────────────────────────────────────────
+                with st.status("Step 4 — Seedance: final_prompt → video", expanded=True) as s2:
+                    s2.write(f"Video ref: `{asset_info['asset_url']}`")
+                    if image_url:
+                        s2.write(f"Image ref: `{image_url}`")
+                    create_result = create_seedance_task(
+                        content,
+                        ratio=ratio,
+                        duration=duration,
+                        resolution=resolution,
+                        generate_audio=generate_audio,
+                    )
+                    task_id = _extract_task_id(create_result)
+                    if not task_id:
+                        raise RuntimeError(f"No task id: {create_result!r}")
+                    st.session_state.result_task_id = task_id
+                    s2.write(f"Task ID: `{task_id}` — polling…")
+
+                    done = poll_until_done(task_id, s2)
+                    video_url = done.get("video_url")
+                    usage = done.get("usage")
+                    if not video_url:
+                        raise RuntimeError("Task succeeded but no video URL returned.")
+                    st.session_state.result_video_url = video_url
+                    st.session_state.result_usage = usage
+                    try:
+                        st.session_state.result_local_path = download_video_to_temp(video_url)
+                    except Exception:
+                        st.session_state.result_local_path = None
+                    s2.update(label="Video ready", state="complete")
+
+                st.success("Pipeline complete: user_prompt → edited → final → video.")
+
+            except Exception as e:
+                st.session_state.last_error = str(e)
+                st.error(str(e))
+            finally:
+                for p in cleanup:
+                    try:
+                        if p and os.path.isfile(p):
+                            os.remove(p)
+                    except OSError:
+                        pass
+
+    # Persist pipeline display after generation
+    if not generate and st.session_state.edited_prompt:
+        st.markdown("##### user_prompt")
+        st.code(st.session_state.user_prompt or "", language=None)
+        st.markdown("##### edited_prompt")
+        st.code(st.session_state.edited_prompt, language=None)
+        st.markdown("##### final_prompt")
+        st.code(st.session_state.final_prompt or "", language=None)
+
+    if st.session_state.last_error and not generate:
+        st.error(st.session_state.last_error)
+
+    if st.session_state.result_video_url:
+        st.subheader("Video")
+        st.video(st.session_state.result_video_url)
+        usage = st.session_state.result_usage
+        st.caption(format_task_usage(usage))
+        if usage:
+            with st.expander("Seedance token details"):
+                st.json(usage)
+
+        local = st.session_state.result_local_path
+        if local and os.path.isfile(local):
+            with open(local, "rb") as f:
+                st.download_button(
+                    "Download MP4",
+                    data=f.read(),
+                    file_name=f"seedance_{st.session_state.result_task_id or 'out'}.mp4",
+                    mime="video/mp4",
+                    use_container_width=True,
+                )
+        else:
+            st.link_button(
+                "Open video URL",
+                st.session_state.result_video_url,
+                use_container_width=True,
+            )
+
+        if st.session_state.result_task_id:
+            st.caption(f"Task ID: `{st.session_state.result_task_id}`")
