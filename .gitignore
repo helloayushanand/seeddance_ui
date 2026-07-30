@@ -4,6 +4,7 @@ env.json
 
 # Local state
 history.json
+seedance_jobs.json
 uploads/
 
 # Python

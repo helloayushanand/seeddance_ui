@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 import auth
+import job_store
 
 _ROOT = Path(__file__).resolve().parent
 
@@ -120,6 +121,8 @@ def _init_session() -> None:
         "final_prompt": None,
         "enhance_tokens": None,
         "jobs": [],
+        "jobs_loaded_for": None,
+        "last_activity_at": time.time(),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -127,6 +130,36 @@ def _init_session() -> None:
 
 
 _init_session()
+
+# Soft idle logout while the tab stays connected (seconds). Default 8 hours.
+# Separate from Streamlit's disconnectedSessionTTL (websocket drop cleanup).
+IDLE_LOGOUT_S = int(os.environ.get("IDLE_LOGOUT_S", str(8 * 60 * 60)))
+
+
+def _touch_activity() -> None:
+    st.session_state.last_activity_at = time.time()
+
+
+def _check_idle_logout() -> None:
+    if not st.session_state.logged_in:
+        return
+    last = float(st.session_state.get("last_activity_at") or time.time())
+    if time.time() - last > IDLE_LOGOUT_S:
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.jobs = []
+        st.session_state.jobs_loaded_for = None
+        st.warning(f"Signed out after {IDLE_LOGOUT_S // 3600}h of inactivity.")
+        st.rerun()
+
+
+def _load_jobs_for_user(username: str) -> None:
+    """Hydrate sidebar jobs from disk (survives refresh / reconnect / re-login)."""
+    if st.session_state.get("jobs_loaded_for") == username and st.session_state.jobs:
+        return
+    st.session_state.jobs = job_store.load(username)
+    st.session_state.jobs_loaded_for = username
+
 
 # ── Login gate ────────────────────────────────────────────────────────────────
 if not st.session_state.logged_in:
@@ -142,10 +175,16 @@ if not st.session_state.logged_in:
             if auth.verify(username, password):
                 st.session_state.logged_in = True
                 st.session_state.username = username
+                _touch_activity()
+                _load_jobs_for_user(username)
                 st.rerun()
             else:
                 st.error("Invalid username or password")
     st.stop()
+
+_check_idle_logout()
+_load_jobs_for_user(st.session_state.username)
+_touch_activity()
 
 
 def _seedream_ok() -> bool:
@@ -482,13 +521,15 @@ def build_content(
 
 
 def _upsert_job(job: Dict[str, Any]) -> None:
+    job = {**job, "username": st.session_state.get("username") or job.get("username") or ""}
+    saved = job_store.upsert(job)
     jobs: List[Dict[str, Any]] = st.session_state.jobs
-    tid = job.get("task_id")
+    tid = saved.get("task_id")
     for i, existing in enumerate(jobs):
         if existing.get("task_id") == tid:
-            jobs[i] = {**existing, **job}
+            jobs[i] = saved
             return
-    jobs.insert(0, job)
+    jobs.insert(0, saved)
 
 
 def _poll_jobs_once() -> bool:
@@ -501,27 +542,44 @@ def _poll_jobs_once() -> bool:
     except Exception:
         return False
 
+    username = st.session_state.get("username") or ""
+    # Prefer disk as source of truth so refresh / multi-tab stay consistent
+    disk_jobs = job_store.load(username) if username else list(st.session_state.jobs)
+    if disk_jobs:
+        st.session_state.jobs = disk_jobs
+
     for job in st.session_state.jobs:
         status = str(job.get("status") or "").lower()
-        if status in ("succeeded", "failed") or not job.get("task_id"):
+        if status in job_store.TERMINAL or not job.get("task_id"):
             continue
         try:
             new_status, raw, video_url, usage = poll_task_once(client, job["task_id"])
+            dirty = False
             if new_status != job.get("status"):
-                changed = True
+                dirty = True
             job["status"] = new_status
             if new_status == "succeeded":
                 job["video_url"] = video_url
                 job["usage"] = usage or extract_task_usage(raw)
                 job["error"] = None
-                changed = True
+                dirty = True
             elif new_status == "failed":
                 err = getattr(raw, "error", None) or getattr(raw, "message", None) or str(raw)
                 job["error"] = str(err)
+                dirty = True
+            if dirty:
+                job_store.update(
+                    job["task_id"],
+                    status=job.get("status"),
+                    video_url=job.get("video_url"),
+                    usage=job.get("usage"),
+                    error=job.get("error"),
+                )
                 changed = True
         except Exception as e:
             job["error"] = str(e)
-            # keep polling next cycle
+            job_store.update(job["task_id"], error=str(e))
+            changed = True
     return changed
 
 
@@ -581,9 +639,14 @@ with st.sidebar:
     col_user, col_logout = st.columns([2, 1])
     col_user.caption(f"Logged in as **{st.session_state.username}**")
     if col_logout.button("Logout"):
+        # Jobs stay on disk — only clear the auth session
         st.session_state.logged_in = False
         st.session_state.username = ""
+        st.session_state.jobs = []
+        st.session_state.jobs_loaded_for = None
         st.rerun()
+
+    st.caption(f"Session idle logout: **{IDLE_LOGOUT_S // 3600}h** · reconnect TTL: **8h**")
 
     st.divider()
     st.header("API")
@@ -617,21 +680,28 @@ with st.sidebar:
     st.subheader("Background jobs")
 
     def _render_jobs_body() -> None:
-        if _poll_jobs_once():
+        # Only poll when something is still running (cuts prod lag / random reruns)
+        has_running = any(
+            str(j.get("status") or "").lower() not in job_store.TERMINAL
+            for j in st.session_state.jobs
+        )
+        if has_running and _poll_jobs_once():
             try:
                 st.rerun(scope="fragment")
             except TypeError:
                 st.rerun()
 
         jobs = st.session_state.jobs
-        running = [j for j in jobs if str(j.get("status") or "").lower() not in ("succeeded", "failed")]
+        running = [
+            j for j in jobs if str(j.get("status") or "").lower() not in job_store.TERMINAL
+        ]
         if running:
             st.caption(f"🔄 {len(running)} running · auto-poll ~{POLL_INTERVAL_S}s")
         elif not jobs:
             st.caption("No jobs yet.")
             return
         else:
-            st.caption(f"{len(jobs)} job(s)")
+            st.caption(f"{len(jobs)} job(s) · saved across refresh / logout")
 
         for job in jobs[:12]:
             status = str(job.get("status") or "unknown")
@@ -643,9 +713,15 @@ with st.sidebar:
                 "queued": "⏳",
             }.get(status, "⏳")
             tid = job.get("task_id") or ""
-            with st.expander(f"{badge} {status} · `{tid[-10:] if tid else '—'}`", expanded=(status not in ("succeeded", "failed"))):
+            with st.expander(
+                f"{badge} {status} · `{tid[-10:] if tid else '—'}`",
+                expanded=(status not in job_store.TERMINAL),
+            ):
                 if job.get("user_prompt"):
-                    st.caption((job["user_prompt"][:100] + ("…" if len(job["user_prompt"]) > 100 else "")))
+                    st.caption(
+                        job["user_prompt"][:100]
+                        + ("…" if len(job["user_prompt"]) > 100 else "")
+                    )
                 if job.get("edited_prompt"):
                     with st.expander("edited_prompt"):
                         st.write(job["edited_prompt"])
@@ -656,7 +732,7 @@ with st.sidebar:
                         st.caption(format_task_usage(job["usage"]))
                 if job.get("error"):
                     st.error(job["error"])
-                if status not in ("succeeded", "failed"):
+                if status not in job_store.TERMINAL:
                     st.caption("Polling in background…")
 
     if hasattr(st, "fragment"):

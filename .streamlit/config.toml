@@ -1,0 +1,20 @@
+[server]
+# Keep disconnected browser sessions alive longer (default is 120s / 2 min).
+# Short TTL looks like a random logout after tab sleep, proxy blips, or long
+# Gemini / S3 / warmup steps that drop the websocket briefly.
+disconnectedSessionTTL = 28800
+
+# Keep websocket alive through proxies / load balancers (seconds).
+# Helps avoid "Connection error" / random breaks in production.
+websocketPingInterval = 30
+
+# Large video / multi-image uploads
+maxUploadSize = 500
+maxMessageSize = 500
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Avoid wiping widget state on script errors mid-run
+fastRerun = true
