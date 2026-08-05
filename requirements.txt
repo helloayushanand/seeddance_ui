@@ -1,4 +1,9 @@
-streamlit>=1.35.0
+streamlit>=1.40.0,<1.62
+# Streamlit 1.61 gzip middleware breaks on Starlette 1.4+ (thread_minimum_size).
+# Cloud was installing starlette==1.4.0 → 500 on every health check.
+starlette>=0.46.0,<1.4.0
+uvicorn>=0.30.0,<1
+
 openai>=1.50.0
 byteplus-python-sdk-v2
 requests

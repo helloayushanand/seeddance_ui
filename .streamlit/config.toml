@@ -14,7 +14,3 @@ maxMessageSize = 500
 
 [browser]
 gatherUsageStats = false
-
-[runner]
-# Avoid wiping widget state on script errors mid-run
-fastRerun = true
