@@ -84,6 +84,8 @@ def update(
     video_url: Optional[str] = None,
     usage: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
+    generation_duration_s: Optional[float] = None,
+    completed_at: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     jobs = _read_all()
     for i, job in enumerate(jobs):
@@ -97,6 +99,10 @@ def update(
             job["usage"] = usage
         if error is not None:
             job["error"] = error
+        if generation_duration_s is not None:
+            job["generation_duration_s"] = generation_duration_s
+        if completed_at is not None:
+            job["completed_at"] = completed_at
         job["updated_at"] = _now()
         jobs[i] = job
         _write_all(jobs)

@@ -6,7 +6,7 @@ Flow:
   → final_prompt → Seedance (video asset + up to 5 extra images) in background
 
 UI:
-  1 video · 1 primary image (Gemini only) · up to 5 images (Seedance only)
+  1 video · 1 primary image (Gemini only) · up to 30 images (Seedance only)
   · prompt · parameters
 
 Run:
@@ -94,7 +94,7 @@ st.set_page_config(page_title="Seedance Edit → Video", page_icon="🎬", layou
 
 POLL_INTERVAL_S = 15
 ASSET_WARMUP_S = 30  # new video assets wait 30s before Seedance
-MAX_SEEDANCE_IMAGES = 5
+MAX_SEEDANCE_IMAGES = 30
 ACTIVE_STATUSES = {
     "queued",
     "running",
@@ -520,8 +520,56 @@ def build_content(
     return content
 
 
+def _elapsed_generation_s(job: Dict[str, Any]) -> Optional[float]:
+    """Seconds from Seedance submit → terminal status."""
+    if job.get("generation_duration_s") is not None:
+        try:
+            return float(job["generation_duration_s"])
+        except (TypeError, ValueError):
+            pass
+    start = job.get("submitted_at") or job.get("created_at")
+    end = job.get("completed_at") or job.get("updated_at")
+    if not start or not end:
+        return None
+    try:
+        from datetime import datetime
+
+        def _parse(ts: str) -> datetime:
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+
+        return max(0.0, (_parse(end) - _parse(start)).total_seconds())
+    except Exception:
+        return None
+
+
+def _format_generation_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+
+def _format_job_metrics(job: Dict[str, Any]) -> str:
+    """Task id + generation duration + tokens (same place in the UI)."""
+    parts = [f"Task ID: `{job.get('task_id') or '—'}`"]
+    parts.append(f"Gen time: {_format_generation_duration(_elapsed_generation_s(job))}")
+    parts.append(format_task_usage(job.get("usage")))
+    return " · ".join(parts)
+
+
 def _upsert_job(job: Dict[str, Any]) -> None:
-    job = {**job, "username": st.session_state.get("username") or job.get("username") or ""}
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    job = {
+        **job,
+        "username": st.session_state.get("username") or job.get("username") or "",
+    }
+    job.setdefault("submitted_at", now_iso)
     saved = job_store.upsert(job)
     jobs: List[Dict[str, Any]] = st.session_state.jobs
     tid = saved.get("task_id")
@@ -562,10 +610,18 @@ def _poll_jobs_once() -> bool:
                 job["video_url"] = video_url
                 job["usage"] = usage or extract_task_usage(raw)
                 job["error"] = None
+                job["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+                job["generation_duration_s"] = _elapsed_generation_s(
+                    {**job, "completed_at": job["completed_at"]}
+                )
                 dirty = True
             elif new_status == "failed":
                 err = getattr(raw, "error", None) or getattr(raw, "message", None) or str(raw)
                 job["error"] = str(err)
+                job["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+                job["generation_duration_s"] = _elapsed_generation_s(
+                    {**job, "completed_at": job["completed_at"]}
+                )
                 dirty = True
             if dirty:
                 job_store.update(
@@ -574,6 +630,8 @@ def _poll_jobs_once() -> bool:
                     video_url=job.get("video_url"),
                     usage=job.get("usage"),
                     error=job.get("error"),
+                    generation_duration_s=job.get("generation_duration_s"),
+                    completed_at=job.get("completed_at"),
                 )
                 changed = True
         except Exception as e:
@@ -680,16 +738,13 @@ with st.sidebar:
     st.subheader("Background jobs")
 
     def _render_jobs_body() -> None:
-        # Only poll when something is still running (cuts prod lag / random reruns)
+        # Poll in-place; fragment already refreshes via run_every — no st.rerun needed.
         has_running = any(
             str(j.get("status") or "").lower() not in job_store.TERMINAL
             for j in st.session_state.jobs
         )
-        if has_running and _poll_jobs_once():
-            try:
-                st.rerun(scope="fragment")
-            except TypeError:
-                st.rerun()
+        if has_running:
+            _poll_jobs_once()
 
         jobs = st.session_state.jobs
         running = [
@@ -728,12 +783,21 @@ with st.sidebar:
                 if job.get("video_url"):
                     st.video(job["video_url"])
                     st.link_button("Open video", job["video_url"])
-                    if job.get("usage"):
-                        st.caption(format_task_usage(job["usage"]))
+                st.caption(_format_job_metrics(job))
+                if job.get("usage") or job.get("generation_duration_s") is not None:
+                    with st.expander("Task metrics"):
+                        st.write(f"**Task ID:** `{job.get('task_id')}`")
+                        st.write(
+                            f"**Generation duration:** "
+                            f"{_format_generation_duration(_elapsed_generation_s(job))}"
+                        )
+                        if job.get("usage"):
+                            st.json(job["usage"])
                 if job.get("error"):
                     st.error(job["error"])
                 if status not in job_store.TERMINAL:
                     st.caption("Polling in background…")
+                    st.caption(_format_job_metrics(job))
 
     if hasattr(st, "fragment"):
         @st.fragment(run_every=POLL_INTERVAL_S)
@@ -760,7 +824,7 @@ col_primary, col_extra = st.columns(2)
 
 with col_primary:
     st.markdown("**Primary image → Gemini enhance**")
-    st.caption("Used only for the prompt enhance layer (Image 1).")
+    st.caption("Only used when **Use enhance layer** is on (sent to Gemini as Image 1).")
     primary_image = st.file_uploader(
         "Primary image (optional)",
         type=["png", "jpg", "jpeg", "webp"],
@@ -806,17 +870,33 @@ user_prompt = st.text_area(
 st.subheader("Parameters")
 p1, p2, p3, p4 = st.columns(4)
 with p1:
+    use_enhance = st.toggle(
+        "Use enhance layer",
+        value=False,
+        help="Off (default): send your user prompt straight to Seedance. "
+        "On: Gemini rewrites the prompt first (needs primary image optionally + GEMINI_API_KEY).",
+    )
     edit_mode = st.radio(
         "Edit workflow",
         options=["General edit", "Replace item or avatar"],
-        help="General: add/remove/modify/dialogue/background. Replace: product/prop/avatar swap.",
+        help="Used when enhance is on. General: add/remove/modify. Replace: product/prop/avatar swap.",
+        disabled=not use_enhance,
     )
 with p2:
-    ratio = st.selectbox("Aspect ratio", ["16:9", "9:16", "1:1", "4:3", "3:4"], index=0)
-    duration = st.slider("Duration (seconds)", 4, 15, 10)
+    st.markdown("**Edit output**")
+    st.caption(
+        "Seedance video-edit tasks use **ratio=adaptive** and **duration=-1** "
+        "(match the input video). Source video must be **4–30 seconds**."
+    )
+    ratio = "adaptive"
+    duration = -1
 with p3:
     resolution = st.selectbox("Seedance resolution", ["1080p", "720p", "480p"], index=0)
-    gemini_model = st.text_input("Gemini model", value=GEMINI_MODEL)
+    gemini_model = st.text_input(
+        "Gemini model",
+        value=GEMINI_MODEL,
+        disabled=not use_enhance,
+    )
 with p4:
     generate_audio = False
     skip_warmup = st.checkbox(
@@ -826,7 +906,7 @@ with p4:
     )
 
 generate = st.button(
-    "Enhance prompt → Queue Seedance (background)",
+    "Enhance → Queue Seedance" if use_enhance else "Queue Seedance (background)",
     type="primary",
     use_container_width=True,
 )
@@ -845,8 +925,8 @@ if generate:
         st.warning("Enter a user prompt.")
     elif not has_video:
         st.warning("Upload a video or paste a video URL.")
-    elif not gemini_ok:
-        st.error("Missing GEMINI_API_KEY.")
+    elif use_enhance and not gemini_ok:
+        st.error("Missing GEMINI_API_KEY (required when enhance layer is on).")
     elif not ark_ok:
         st.error("Missing ARK_API_KEY or BYTEPLUS_API_KEY.")
     elif not seedream_ok:
@@ -868,35 +948,45 @@ if generate:
 
             st.session_state.user_prompt = user_prompt.strip()
 
-            # ── Step A: enhance (primary image only → Gemini) ───────────────
-            with st.status("Step 1 — Enhance: user_prompt → edited_prompt", expanded=True) as s_enh:
-                s_enh.write(f"Model: `{gemini_model}` · workflow: `{edit_mode}`")
-                s_enh.write("Uploading Video 1 to Gemini…")
-                if primary_path:
-                    s_enh.write("Including primary image (Gemini only)…")
-                else:
-                    s_enh.write("No primary image — enhance from video + prompt only.")
-                edited_prompt, token_info = enhance_user_prompt(
-                    video_path=video_path,
-                    image_path=primary_path,
-                    user_prompt=user_prompt.strip(),
-                    edit_mode=edit_mode,
-                    model=(gemini_model or GEMINI_MODEL).strip(),
-                )
-                st.session_state.edited_prompt = edited_prompt
-                st.session_state.enhance_tokens = token_info
-                final_prompt = compose_final_prompt(
-                    edit_mode=edit_mode,
-                    edited_prompt=edited_prompt,
-                    user_prompt=user_prompt.strip(),
-                )
-                st.session_state.final_prompt = final_prompt
-                s_enh.update(label="Enhance complete", state="complete")
+            # ── Step A: optional enhance (primary image only → Gemini) ──────
+            if use_enhance:
+                with st.status(
+                    "Step 1 — Enhance: user_prompt → edited_prompt", expanded=True
+                ) as s_enh:
+                    s_enh.write(f"Model: `{gemini_model}` · workflow: `{edit_mode}`")
+                    s_enh.write("Uploading Video 1 to Gemini…")
+                    if primary_path:
+                        s_enh.write("Including primary image (Gemini only)…")
+                    else:
+                        s_enh.write("No primary image — enhance from video + prompt only.")
+                    edited_prompt, token_info = enhance_user_prompt(
+                        video_path=video_path,
+                        image_path=primary_path,
+                        user_prompt=user_prompt.strip(),
+                        edit_mode=edit_mode,
+                        model=(gemini_model or GEMINI_MODEL).strip(),
+                    )
+                    st.session_state.edited_prompt = edited_prompt
+                    st.session_state.enhance_tokens = token_info
+                    final_prompt = compose_final_prompt(
+                        edit_mode=edit_mode,
+                        edited_prompt=edited_prompt,
+                        user_prompt=user_prompt.strip(),
+                    )
+                    st.session_state.final_prompt = final_prompt
+                    s_enh.update(label="Enhance complete", state="complete")
+            else:
+                # Skip Gemini — user prompt goes straight to Seedance
+                st.session_state.edited_prompt = user_prompt.strip()
+                st.session_state.final_prompt = user_prompt.strip()
+                st.session_state.enhance_tokens = None
+                st.info("Enhance layer off — using user prompt as final_prompt for Seedance.")
 
             st.markdown("##### user_prompt")
             st.code(st.session_state.user_prompt, language=None)
-            st.markdown("##### edited_prompt")
-            st.code(st.session_state.edited_prompt, language=None)
+            if use_enhance:
+                st.markdown("##### edited_prompt")
+                st.code(st.session_state.edited_prompt, language=None)
             st.markdown("##### final_prompt (queued to Seedance)")
             st.code(st.session_state.final_prompt, language=None)
             if st.session_state.enhance_tokens:
@@ -1014,10 +1104,11 @@ if generate:
             with st.status("Step 4 — Submit Seedance (background)", expanded=True) as s2:
                 s2.write(f"Video ref: `{asset_info['asset_url']}`")
                 s2.write(f"Seedance images: {len(seedance_image_urls)}")
+                s2.write("Edit params: `ratio=adaptive`, `duration=-1` (match input video)")
                 create_result = create_seedance_task(
                     content,
-                    ratio=ratio,
-                    duration=duration,
+                    ratio="adaptive",
+                    duration=-1,
                     resolution=resolution,
                     generate_audio=generate_audio,
                 )
@@ -1039,6 +1130,7 @@ if generate:
                         "resolution": resolution,
                         "video_url": None,
                         "usage": extract_task_usage(create_result),
+                        "generation_duration_s": None,
                         "error": None,
                     }
                 )
@@ -1047,8 +1139,12 @@ if generate:
                 s2.update(label="Queued in background", state="complete")
 
             st.success(
-                "Enhance done · Seedance queued. Watch **Background jobs** in the sidebar — "
-                "you can start another generation now."
+                (
+                    "Enhance done · Seedance queued. "
+                    if use_enhance
+                    else "Seedance queued (no enhance). "
+                )
+                + "Watch **Background jobs** in the sidebar — you can start another generation now."
             )
 
         except Exception as e:

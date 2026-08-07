@@ -14,7 +14,7 @@ ARK_BASE_URL = os.environ.get(
     "ARK_BASE_URL", "https://ark.ap-southeast.bytepluses.com/api/v3"
 )
 SEEDANCE_MODEL = os.environ.get(
-    "SEEDANCE_MODEL", "dreamina-seedance-2-0-260128"
+    "SEEDANCE_MODEL", "dreamina-seedance-2-5-260628"
 )
 GEMINI_VIDEO_MODEL = os.environ.get("GEMINI_VIDEO_MODEL", "gemini-3.5-flash")
 FILE_SERVER_URL = os.environ.get(
@@ -847,11 +847,18 @@ def _extract_task_id(create_result: Any) -> Optional[str]:
 def create_seedance_task(
     content: List[Dict[str, Any]],
     *,
-    ratio: str = "16:9",
-    duration: int = 15,
+    ratio: str = "adaptive",
+    duration: int = -1,
     resolution: str = "1080p",
     generate_audio: bool = False,
 ) -> Any:
+    """
+    Create a Seedance content-generation task.
+
+    Video-edit tasks (reference video in content) require:
+      ratio="adaptive", duration=-1
+    so output matches the selected input video (must be 4–30s).
+    """
     client = get_ark_client()
     extra_body: Dict[str, Any] = {
         "ratio": ratio,
